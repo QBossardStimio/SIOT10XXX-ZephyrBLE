@@ -1,0 +1,1 @@
+# SIOT10XXX-ZephyrBLE
