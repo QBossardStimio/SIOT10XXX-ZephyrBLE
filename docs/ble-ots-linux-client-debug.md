@@ -167,15 +167,80 @@ if err != 0:
 
 **État :** Partiellement contourné. `ots_conn_disconnected()` est appelé par Zephyr OTS à la déconnexion (visible dans les logs DBG), ce qui devrait nettoyer le contexte L2CAP. Mais l'objet dans `obj_pool[]` reste `in_use=true` car `obj_deleted()` n'est appelé que sur OACP Delete explicite.
 
-**Solution à implémenter :** Ajouter dans `ots_handler.c` une fonction `ots_handler_cleanup_on_disconnect()` appelée depuis `main.c::disconnected()` qui remet tous les slots `in_use=false` et `obj_count=0`.
+**Solution :** Implémenté — `ots_handler_cleanup_on_disconnect()` appelée depuis `main.c::disconnected()`. Remet tous les slots `in_use=false`, appelle `bt_ots_obj_delete()` pour chaque slot actif, et remet `obj_count=0`.
+
+**Fichier :** `zephyr/samples/bluetooth/peripheral_ots_railnet/src/ots_handler.c`
 
 ---
 
-## Problème en cours : L2CAP CoC impossible depuis socket raw Python
+### 9. SDU_LEN header manquant — BlueZ SOCK_SEQPACKET ne le préfixe pas
+
+**Symptôme :** Chunks 2+ échouent côté NINA avec `L2CAP RX PDU total exceeds SDU` (`sdu_len=1`, `sdu_len=2`...).
+
+**Cause :** BlueZ `SOCK_SEQPACKET` L2CAP CoC **n'ajoute PAS** automatiquement le SDU_LEN header (2 bytes LE16 au début du premier PDU du SDU). Zephyr `l2cap_chan_le_recv_seg_direct()` fait `pull_le16(seg)` sur les 2 premiers bytes pour lire `_sdu_len`. Sans le header, Zephyr lit les bytes de données comme `_sdu_len` → valeur absurde → rejet.
+
+**Diagnostic :** Log ajouté dans `l2cap.c:2688` a montré `sdu_len=1` pour chunk 2 (= `chunk_idx` encodé en LE16, dont le premier byte vaut `0x01`).
+
+**Correction :**
+```python
+# Dans send_l2cap() — ots_transfer.py
+pdu = struct.pack("<H", len(payload)) + payload
+sock.send(pdu)
+```
+
+**Fichier :** `tools/ots_transfer.py`
+
+---
+
+### 10. `bt_ots_obj_delete` retourne -EBUSY depuis `obj_write` callback
+
+**Symptôme :** Pool OTS saturé après 4 chunks (pool 4/4), OACP Create échoue avec `Insufficient Resources`.
+
+**Cause :** `bt_ots_obj_delete()` vérifie `obj->state.type == BT_GATT_OTS_OBJECT_IDLE_STATE`. Or, `oacp_write_common()` (ots_oacp.c:601) remet l'objet en IDLE **après** le retour du callback `obj_write`. Appel direct depuis `obj_write` → objet encore en WRITE state → -EBUSY.
+
+**Correction :** Différer la suppression via `k_work_submit()` :
+```c
+static uint64_t pending_delete_id;
+static K_WORK_DEFINE(delete_work, delete_work_handler);
+
+static void delete_work_handler(struct k_work *work) {
+    bt_ots_obj_delete(ots_instance, pending_delete_id);
+}
+
+// Dans obj_write, quand remaining == 0 :
+pending_delete_id = id;
+k_work_submit(&delete_work);
+```
+
+Le work handler s'exécute sur la system workqueue après que la stack OTS a remis l'objet en IDLE.
+
+**Fichier :** `zephyr/samples/bluetooth/peripheral_ots_railnet/src/ots_handler.c`
+
+---
+
+### 11. `rename()` EXDEV dans sotp-bridge — cross-device link
+
+**Symptôme :** `rename /tmp/sotp_XXXXXX -> /var/lib/sotp-bridge/ble_obj_000000.bin failed: Invalid cross-device link`
+
+**Cause :** `mkstemp()` crée le fichier temporaire dans `/tmp` (tmpfs). La destination `/var/lib/sotp-bridge` est sur le rootfs. `rename()` ne fonctionne pas entre filesystems différents → `EXDEV`.
+
+**Correction :** Fallback copy+unlink quand `errno == EXDEV` :
+```c
+if (rename(src, dst) == 0) { /* OK */ }
+else if (errno == EXDEV) {
+    // open(src), open(dst, O_CREAT|O_TRUNC), read/write loop, close, unlink(src)
+}
+```
+
+**Fichier :** `layers/STIMIODEV/SIOT10069-stimio-meta-app/recipes-connectivity/sotp-bridge/files/sotp-bridge.c`
+
+---
+
+## Problème résolu : L2CAP CoC impossible depuis socket raw Python
 
 ### Description
 
-C'est le problème **bloquant actuel**. Le canal L2CAP CoC PSM 0x0025 ne s'ouvre jamais côté NINA, malgré :
+Ce problème a été le **bloquant principal** avant la solution `libc.connect()` avec `sockaddr_l2`. Le canal L2CAP CoC PSM 0x0025 ne s'ouvre jamais côté NINA, malgré :
 - NINA confirmée fonctionnelle (PSM 0x0025 enregistré, `l2cap_accept` visible en logs DBG)
 - Connexion GATT Bleak opérationnelle (OACP Create, Name Write OK)
 - Handle HCI connexion existante : `2048` (confirmé via `hcitool con`)
