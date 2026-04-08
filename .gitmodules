@@ -1,0 +1,4 @@
+[submodule "zephyrproject/zephyr"]
+	path = zephyrproject/zephyr
+	url = git@github.com:QBossardStimio/zephyr_4_3_0.git
+	branch = feature.railnet200-ots-file-transfer

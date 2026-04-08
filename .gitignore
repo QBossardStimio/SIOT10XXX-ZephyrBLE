@@ -1,0 +1,18 @@
+# Python virtualenv
+.venv*/
+
+# Zephyr build artifacts
+build*/
+zephyrproject/build*/
+
+# West-managed modules (restored via `west update`)
+zephyrproject/bootloader/
+zephyrproject/modules/
+zephyrproject/tools/
+
+# IDE
+.vscode/
+.idea/
+
+# Superpowers plugin cache
+docs/superpowers/
