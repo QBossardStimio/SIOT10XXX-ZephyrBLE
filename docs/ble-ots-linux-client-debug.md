@@ -477,6 +477,47 @@ systemctl stop ppp
 
 ---
 
+### 23. ACK confusion dans multi-chunk FILE_REQUEST
+
+**Symptôme** : le sotp-bridge envoie le chunk 0 puis timeout en attente de l'ACK. Le CRC mismatch `recv=0xaaf9 calc=0xc2f9` est reproductible à chaque fois.
+
+**Cause** : Quand le sotp-bridge envoie un OBJ_TO_BLE, la NINA l'ajoute au pool OTS et envoie immédiatement un ACK (type 0x03). Le `wait_for_ack` du sotp-bridge devait attendre le DELETE_ACK (type 0x07) mais recevait le ACK normal (0x03) qui arrivait pendant le flush, et les octets résiduels dans le buffer UART corrompaient le CRC.
+
+**Correction** :
+1. Introduire `SOTP_TYPE_DELETE_ACK` (0x07) distinct de `SOTP_TYPE_ACK` (0x03)
+2. Vider le buffer UART (flush 50ms) avant d'attendre le DELETE_ACK
+3. Réinitialiser la state machine SOTP RX dans `wait_for_ack`
+
+**Fichiers** : `uart_relay.h`, `uart_relay.c`, `sotp-bridge.c`
+
+---
+
+### 24. bt_ots_obj_delete passe toujours conn=NULL au callback obj_deleted
+
+**Symptôme** : le DELETE_ACK n'est jamais envoyé car le test `if (conn)` dans `obj_deleted` est toujours faux.
+
+**Cause** : Zephyr `bt_ots_obj_delete()` (ots.c:420) appelle `obj_deleted(ots, NULL, obj->id)` avec conn=NULL **toujours**, que la suppression vienne d'un OACP Delete client ou d'un appel interne.
+
+**Correction** : utiliser un flag `cleaning_up` au lieu de tester `conn`. Le flag est mis à `true` pendant `ots_handler_cleanup_on_disconnect()` et `false` sinon. `obj_deleted` envoie le DELETE_ACK quand `!cleaning_up`.
+
+**Fichier** : `ots_handler.c`
+
+---
+
+### 25. BlueZ SOCK_SEQPACKET limite les crédits L2CAP à ~16
+
+**Symptôme** : un objet OTS de 30 KB n'est reçu qu'à hauteur de ~6.7 KB (26 SDUs × 258 bytes). Le `recv()` retourne EOF après 6708 bytes.
+
+**Cause** : BlueZ `SOCK_SEQPACKET` pour L2CAP CoC n'accorde que ~16 crédits initiaux au récepteur. Chaque crédit permet un SDU de ~258 bytes (MPS 245 + SDU_LEN 2 + overhead). 16 × 258 ≈ 4128 bytes maximum recevable. Les crédits supplémentaires ne sont pas accordés tant que le SDU complet n'est pas consommé par `recv()`, mais le SDU fait 30 KB et ne peut jamais être "complet" avec seulement 16 crédits.
+
+**Contournement** : réduire les chunks OTS à 3800 bytes (15 SDUs, dans les 16 crédits).
+
+**Amélioration future** : utiliser `SOCK_STREAM`, l'API D-Bus BlueZ, ou patcher le kernel.
+
+**Fichier** : `sotp-bridge.c` (OTS_OBJ_MAX_SIZE)
+
+---
+
 ## Problème résolu : L2CAP CoC impossible depuis socket raw Python
 
 ### Description

@@ -132,7 +132,68 @@ md5sum /tmp/test_received.bin
 
 ### Limite
 - `sotp-send` est limité à 32 KB (taille max d'un objet OTS dans le pool NINA)
-- Pour des fichiers > 32 KB dans le sens iMX6 → Ubuntu, il faudrait un mécanisme multi-objet côté iMX6
+- Préférer la commande `request` qui gère automatiquement les gros fichiers
+
+## Test 5 : Request fichier spécifique (commande unifiée)
+
+### Commandes
+
+```bash
+# Ubuntu — demander un fichier par son chemin
+python3 ots_transfer.py DE:CA:F1:5B:AD:11 request --path /etc/stimio/config.json -o /tmp/config.json
+```
+
+### Résultat attendu
+- Le script affiche le MD5 directement
+- 1 chunk pour les fichiers < 3.8 KB
+- Durée : ~35s
+
+### Résultat validé (2026-04-08)
+```
+MD5 : e13fad91637b1e88235325f045b1a705 — PASS (3/3 runs)
+```
+
+## Test 6 : Request fichier 100 KB (multi-chunk)
+
+### Commandes
+
+```bash
+# iMX6 — créer un fichier de test + arrêter le modem USB
+systemctl stop ppp
+dd if=/dev/urandom of=/tmp/test_100k.bin bs=1024 count=100
+md5sum /tmp/test_100k.bin
+
+# Ubuntu
+python3 ots_transfer.py DE:CA:F1:5B:AD:11 request --path /tmp/test_100k.bin -o /tmp/test_100k_recv.bin
+```
+
+### Résultat attendu
+- 27 chunks de ~3.8 KB chacun
+- MD5 match
+- Durée : ~15 min (limité par les crédits L2CAP BlueZ, voir optimisations)
+
+### Résultat validé (2026-04-09)
+```
+Taille : 102400 bytes, 27 chunks
+MD5    : 0d55302f9f6354d0fffba5fa1b8e12c5 — PASS
+Durée  : 896s (~15 min)
+```
+
+## Test 7 : Request fichier inexistant (erreur)
+
+### Commandes
+
+```bash
+python3 ots_transfer.py DE:CA:F1:5B:AD:11 request --path /tmp/does_not_exist.bin -o /tmp/nope.bin
+```
+
+### Résultat attendu
+- Timeout 30s puis message d'erreur
+
+### Résultat validé (2026-04-08)
+```
+ERREUR : aucun objet reçu après 15.4s (fichier introuvable ou erreur iMX6)
+```
 
 ## Bugs résolus pendant les tests
 
@@ -166,6 +227,21 @@ md5sum /tmp/test_received.bin
 - **Symptôme** : sotp-bridge ne reçoit pas les trames SOTP OBJ_FROM_BLE de la NINA
 - **Cause** : sotp-bridge.c compilé avec `B1000000` alors que la NINA est à 115200
 - **Fix** : recompiler sotp-bridge avec `B115200` (nécessite rebuild Yocto)
+
+### 7. ACK confusion dans multi-chunk FILE_REQUEST
+- **Symptôme** : CRC mismatch reproductible `recv=0xaaf9 calc=0xc2f9` en attente d'ACK
+- **Cause** : l'ACK normal (0x03) de `add_object` arrivait dans le buffer UART avant le DELETE_ACK (0x07), corrompant la state machine SOTP
+- **Fix** : flush du buffer UART (50ms) + reset state machine dans `wait_for_ack()` avant d'attendre le DELETE_ACK
+
+### 8. bt_ots_obj_delete passe conn=NULL au callback
+- **Symptôme** : DELETE_ACK jamais envoyé, `if (conn)` toujours faux
+- **Cause** : Zephyr `bt_ots_obj_delete()` passe toujours NULL pour conn
+- **Fix** : utiliser un flag `cleaning_up` au lieu de tester conn
+
+### 9. BlueZ SOCK_SEQPACKET limite les crédits L2CAP à ~16
+- **Symptôme** : objets OTS de 30 KB reçus partiellement (~6.7 KB seulement)
+- **Cause** : BlueZ n'accorde que ~16 crédits L2CAP initiaux au récepteur
+- **Contournement** : réduire les chunks à 3800 bytes (15 SDUs, dans les 16 crédits)
 
 ## Commandes utiles pour le debug
 

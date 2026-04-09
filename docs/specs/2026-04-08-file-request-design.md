@@ -117,14 +117,48 @@ Séquence :
 11. Recevoir les données (strip SDU_LEN headers)
 12. Tronquer à `obj_size_cur` et sauvegarder
 
+## Multi-chunk (implémenté)
+
+Les fichiers > 3.8 KB sont découpés en chunks de 3800 bytes max. Chaque chunk est envoyé comme un objet OTS séparé avec le header `[chunk_idx 2B][chunk_total 2B][path_len 2B][data]` (même format que le send).
+
+### Synchronisation multi-chunk
+
+```
+sotp-bridge                    NINA                         Python
+    |-- OBJ_TO_BLE chunk 0 -->|                              |
+    |                          |-- add to OTS pool           |
+    |<-- ACK (type 0x03) -----|                              |
+    |   (flushed by wait_for_ack)                            |
+    |                          |                  <-- OLCP poll
+    |                          |                  <-- OACP Read
+    |                          |-- L2CAP data -->|
+    |                          |                  <-- OACP Delete
+    |                          |-- obj_deleted               |
+    |<-- DELETE_ACK (0x07) ----|                              |
+    |-- OBJ_TO_BLE chunk 1 -->|                              |
+    ...
+```
+
+### Nouveau type SOTP
+
+```c
+#define SOTP_TYPE_DELETE_ACK  0x07U
+```
+
+La NINA envoie un DELETE_ACK (type 0x07) quand un objet est supprimé par un client BLE (OACP Delete). Le sotp-bridge attend ce DELETE_ACK avant d'envoyer le chunk suivant. Le ACK normal (type 0x03) envoyé par `ots_handler_add_object_from_uart` est flushed par `wait_for_ack` pour éviter la confusion.
+
+### Limite de taille chunk : 3800 bytes
+
+BlueZ `SOCK_SEQPACKET` n'accorde que ~16 crédits L2CAP initiaux au récepteur. Chaque crédit permet un SDU de ~258 bytes. Total recevable = 16 × 256 = ~4096 bytes. Avec marge de sécurité → 3800 bytes par objet OTS.
+
 ## Gestion d'erreurs
 
 | Cas | Côté sotp-bridge | Côté Python |
 |-----|-------------------|-------------|
-| Fichier introuvable | NACK 0x10 | Timeout 15s → message d'erreur |
-| Fichier > 32 KB | NACK 0x11 | Timeout 15s → message d'erreur |
-| Erreur I/O | NACK 0x12 | Timeout 15s → message d'erreur |
-| Pool OTS plein (NINA) | NINA NACK au sotp-bridge | Timeout 15s |
+| Fichier introuvable | NACK 0x10 | Timeout 30s → message d'erreur |
+| Fichier > 2 MB | NACK 0x11 | Timeout 30s → message d'erreur |
+| Erreur I/O | NACK 0x12 | Timeout 30s → message d'erreur |
+| Pool OTS plein (NINA) | NINA NACK au sotp-bridge | Timeout 30s |
 | Déconnexion BLE | N/A | Timeout naturel |
 
 Python détecte tous les échecs par timeout car il n'y a pas de canal de retour SOTP→BLE pour les NACK.
@@ -136,7 +170,50 @@ Python détecte tous les échecs par timeout car il n'y a pas de canal de retour
 - Le format SOTP OBJ_TO_BLE `[NAME_LEN][NAME][DATA]` est réutilisé tel quel
 - Le sotp-bridge continue de recevoir les OBJ_FROM_BLE et de les écrire en fichiers
 
-## Évolution future
+## Résultats de test
 
-- Support fichiers > 32 KB : le sotp-bridge enverrait plusieurs OBJ_TO_BLE avec un mécanisme de chunking (header chunk_idx/chunk_total, comme le send)
-- Canal de retour pour les erreurs : caractéristique GATT custom ou réponse dans le pool OTS
+| Fichier | Taille | Chunks | Durée | MD5 |
+|---------|--------|--------|-------|-----|
+| config.json | 522 B | 1 | ~35s | PASS |
+| test_100k.bin | 100 KB | 27 | ~15 min | PASS |
+
+## Optimisations futures (plan)
+
+### 1. Augmenter les crédits L2CAP BlueZ (priorité haute)
+
+**Problème** : BlueZ SOCK_SEQPACKET n'accorde que ~16 crédits L2CAP initiaux, limitant les chunks à ~3.8 KB. Avec 30 KB par chunk, le transfert 100 KB prendrait 4 chunks au lieu de 27.
+
+**Pistes** :
+- Configurer `BT_RCVMTU` avant `connect()` (testé, pas d'effet sur SEQPACKET)
+- Utiliser `SOCK_STREAM` au lieu de `SOCK_SEQPACKET` (BlueZ gère les crédits en flux continu)
+- Patcher le kernel BlueZ pour augmenter les crédits initiaux L2CAP CoC
+- Utiliser l'API D-Bus BlueZ `AcquireNotify` / `AcquireWrite` au lieu de raw sockets
+
+**Impact** : réduirait le nombre de chunks de ~27 à ~4 pour 100 KB, et de ~553 à ~35 pour 2 MB.
+
+### 2. Réduire le polling OLCP (priorité moyenne)
+
+**Problème** : chaque chunk nécessite un polling OLCP (GoTo First → GoTo Next → Read Name) avec 500ms entre les tentatives. Ça ajoute ~1-3s par chunk.
+
+**Pistes** :
+- Réduire l'intervalle de poll à 100ms
+- Utiliser une caractéristique GATT custom pour notifier Python quand un objet est ajouté
+- Pré-charger 2-3 chunks dans le pool OTS (pipeline)
+
+### 3. Passer le baudrate UART à 1 Mbaud (priorité moyenne)
+
+**Problème** : à 115200 baud, un chunk de 3.8 KB prend ~330ms sur l'UART. À 1 Mbaud, ce serait ~38ms.
+
+**Prérequis** :
+- Investiguer le DTS iMX6 pour router les pins RTS/CTS vers la NINA
+- Activer `hw-flow-control` dans le DTS Zephyr NINA
+- Réactiver les pins RTS/CTS dans le pinctrl
+- Recompiler sotp-bridge avec `B1000000` + `CRTSCTS`
+
+### 4. Canal de retour pour les erreurs (priorité basse)
+
+**Problème** : Python ne peut pas savoir si le FILE_REQUEST a échoué (fichier introuvable, trop gros). Il doit attendre le timeout de 30s.
+
+**Pistes** :
+- Caractéristique GATT custom pour les erreurs SOTP
+- Objet OTS "erreur" avec un nom spécial (ex: `ERR:NOT_FOUND`)
