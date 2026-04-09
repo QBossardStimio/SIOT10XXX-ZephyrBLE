@@ -69,6 +69,20 @@ Le bottleneck principal est la taille des chunks (3.8 KB) limitée par les créd
 - Objet OTS "erreur" avec un nom spécial (ex: `ERR:NOT_FOUND`)
 - Caractéristique GATT custom pour les notifications d'erreur SOTP
 
+### 5. Cohabitation PPP + transfert BLE (priorité haute)
+
+**Problème** : le service PPP (modem Quectel EG91 sur USB) doit être arrêté (`systemctl stop ppp`) avant tout transfert BLE. Sinon, les reconnexions USB du modem génèrent des interruptions kernel qui corrompent les trames UART entre NINA et iMX6 (CRC mismatch, octets perdus). Cela rend l'outil inutilisable en production où le PPP est toujours actif.
+
+**Cause racine** : le driver `ci_hdrc` (USB OTG iMX6) génère des interruptions lors de l'énumération USB du modem Quectel. Ces interruptions perturbent le timing du driver UART `ttymxc7` (pas de FIFO matériel côté iMX6, chaque octet est une interruption).
+
+**Pistes** :
+1. **UART hw-flow-control (RTS/CTS)** — le flow control matériel empêcherait la perte d'octets quand le CPU est occupé par les interruptions USB. C'est la même optimisation que #2, et elle résoudrait les deux problèmes en même temps.
+2. **Retry SOTP avec CRC** — au lieu de considérer un CRC mismatch comme fatal, le sotp-bridge renvoie un NACK et le sotp-bridge/NINA retransmet la trame. Ajoute de la latence mais tolère les corruptions occasionnelles.
+3. **DMA UART** — utiliser le mode DMA du driver ttymxc au lieu du mode PIO. Le DMA ne dépend pas des interruptions CPU pour chaque octet. Nécessite une investigation du DTS iMX6 pour activer `dmas = <&sdma ...>` sur `&uart8`.
+4. **Réduire la fréquence d'énumération USB** — configurer le modem Quectel pour éviter les reconnexions périodiques (`AT+CFUN` ou configuration USB autosuspend).
+
+**Impact** : critique pour l'utilisation en production. Sans cette optimisation, l'outil nécessite une intervention manuelle (arrêt PPP) à chaque transfert.
+
 ## Temps estimés après optimisations combinées
 
 | Fichier | Actuel | #1 seul | #1 + #2 | #1 + #2 + #3 |
