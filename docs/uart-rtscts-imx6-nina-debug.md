@@ -276,3 +276,5 @@ tty.c_cflag |= CRTSCTS;   /* hardware flow control activé */
 | 2026-04-10 | Inversion pinctrl NINA : CTS↔P0.31, RTS↔P1.12 | **Flow control bidirectionnel validé** |
 | 2026-04-10 | Test RTT dual-pin : P0.31=0, P1.12=0 | Les deux signaux assertés ✅ |
 | 2026-04-10 | Test RX iMX6 avec `crtscts` : 0xAA reçus | Communication NINA→iMX6 avec flow control ✅ |
+| 2026-04-10 | Suite OTS 4/4 à 115200 + RTS/CTS + PPP actif | Tous PASS, aucun CRC mismatch ✅ |
+| 2026-04-10 | Passage à 1 Mbaud + RTS/CTS | Suite OTS 4/4 PASS, Send 1MB : 42s (vs 119s) ✅ |

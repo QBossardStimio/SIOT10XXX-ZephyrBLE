@@ -264,11 +264,94 @@ JLinkRTTLogger -Device NRF52840_XXAA -If SWD -Speed 4000
 ```bash
 # iMX6
 journalctl -u sotp-bridge --no-pager -n 5
-# Doit afficher : opened /dev/ttymxc7 at 115200 baud
+# Doit afficher : opened /dev/ttymxc7 at 1000000 baud (hw flow control RTS/CTS)
 ```
 
-### Arrêter le modem USB (réduit les interférences UART)
-```bash
-# iMX6
-systemctl stop ppp
+### Modem USB et PPP
+Le service PPP peut rester actif pendant les transferts OTS grâce au
+hardware flow control (RTS/CTS). Avant RTS/CTS, il fallait `systemctl stop ppp`.
+
+---
+
+## Historique des performances — Comparatif
+
+### Configuration matérielle
+
 ```
+PC Ubuntu 24.04  ←— BLE OTS L2CAP CoC —→  NINA-B301 (nRF52840)  ←— UART SOTP —→  iMX6UL (Yocto Linux)
+  BlueZ 5.72                                peripheral_ots_railnet              sotp-bridge
+  hci0 (Realtek)                            hw-flow-control RTS/CTS             /dev/ttymxc7
+```
+
+### Phase 1 — Sans RTS/CTS (2026-04-08 → 2026-04-09)
+
+- **Baudrate UART** : 115200
+- **Flow control** : aucun
+- **PPP** : **doit être arrêté** (`systemctl stop ppp`) sinon CRC mismatch systématique
+- **Cause** : le modem Quectel USB redémarre en boucle (~13s), les interrupts kernel
+  perturbent l'UART non protégé
+
+| Test | Taille | Durée | MD5 | Condition |
+|---|---|---|---|---|
+| Send petit fichier | ~500 B | ~5s | OK | PPP arrêté |
+| Request config.json | 522 B | ~35s | OK | PPP arrêté |
+| Request 100 KB (27 chunks) | 102 400 B | **896s (14m56)** | OK | PPP arrêté |
+| Send 1 MB (35 chunks) | 1 048 576 B | ~120s | OK | PPP arrêté |
+| **Tout test avec PPP actif** | — | **ÉCHEC** | CRC mismatch | Modem USB actif |
+
+### Phase 2 — RTS/CTS à 115200 baud (2026-04-10)
+
+- **Baudrate UART** : 115200
+- **Flow control** : hardware RTS/CTS
+- **PPP** : **actif** (modem en boucle de restart, pas de carte SIM)
+- **Fix appliqué** : pinctrl NINA corrigé (CTS/RTS étaient inversés), DCE_CTS/DCE_RTS
+  côté iMX6, `CRTSCTS` dans sotp-bridge
+
+| Test | Taille | Durée | MD5 | vs Phase 1 |
+|---|---|---|---|---|
+| Send petit fichier | 11 B | 7.3s | OK | ~identique |
+| Request config.json | 522 B | 38.9s | OK | ~identique |
+| Request 100 KB | 102 400 B | **881s (14m41)** | OK | -1.7% |
+| Send 1 MB | 1 048 576 B | **119s** | OK | ~identique |
+| **Avec PPP actif** | — | **OK** | ✅ | **avant : impossible** |
+
+**Conclusion** : le RTS/CTS n'ajoute aucun overhead mesurable et permet la cohabitation avec le PPP.
+
+### Phase 3 — RTS/CTS à 1 Mbaud (2026-04-10)
+
+- **Baudrate UART** : 1 000 000
+- **Flow control** : hardware RTS/CTS
+- **PPP** : **actif** (modem en boucle de restart, pas de carte SIM)
+
+| Test | Taille | Durée | MD5 | vs Phase 1 | vs Phase 2 |
+|---|---|---|---|---|---|
+| Send petit fichier | 11 B | 7.1s | OK | — | — |
+| Request config.json | 522 B | 34.6s | OK | — | -11% |
+| Request 100 KB | 102 400 B | **879s (14m39)** | OK | -1.9% | -0.2% |
+| Send 1 MB | 1 048 576 B | **42.3s** | OK | **-64.7%** | **-64.5%** |
+| **Avec PPP actif** | — | **OK** | ✅ | ✅ | ✅ |
+
+### Analyse
+
+**Send 1 MB** : gain majeur de **2.8×** (119s → 42s). Le send est dominé par le transfert
+UART (BLE envoie 35 chunks de ~30 KB vers la NINA qui les relaye en SOTP sur l'UART).
+Le passage de 115200 à 1 Mbaud réduit le temps UART d'un facteur ~8.7×.
+
+**Request 100 KB** : gain faible (-0.2%). Le request est dominé par le **polling OLCP BLE**
+(~33s de latence par chunk × 27 chunks). Le temps UART (100 KB à 1 Mbaud = ~1s) est
+négligeable face à l'overhead BLE. Optimisation future : augmenter les crédits L2CAP
+ou augmenter la taille des chunks (voir `docs/specs/2026-04-09-file-request-optimizations.md`).
+
+**Cohabitation PPP** : le gain le plus important. Avant RTS/CTS, le service PPP devait
+être arrêté pour tout transfert OTS. Maintenant, les transferts fonctionnent avec le
+modem Quectel en boucle de restart permanente (stress maximum sur le bus USB/kernel).
+
+### Résumé pour le management
+
+| Métrique | Avant | Après | Gain |
+|---|---|---|---|
+| Cohabitation PPP + BLE OTS | **Non** | **Oui** | Fonctionnalité débloquée |
+| Envoi fichier 1 MB vers iMX6 | 120s | **42s** | **×2.8 plus rapide** |
+| Récupération fichier 100 KB | 896s | 879s | ~identique (goulot BLE) |
+| Fiabilité avec modem actif | 0% (CRC errors) | **100%** | Zéro erreur sur 4 tests |
+| Baudrate UART | 115200 | **1 000 000** | ×8.7 bande passante |
