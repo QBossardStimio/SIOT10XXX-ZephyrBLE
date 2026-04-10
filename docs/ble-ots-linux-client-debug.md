@@ -167,15 +167,362 @@ if err != 0:
 
 **État :** Partiellement contourné. `ots_conn_disconnected()` est appelé par Zephyr OTS à la déconnexion (visible dans les logs DBG), ce qui devrait nettoyer le contexte L2CAP. Mais l'objet dans `obj_pool[]` reste `in_use=true` car `obj_deleted()` n'est appelé que sur OACP Delete explicite.
 
-**Solution à implémenter :** Ajouter dans `ots_handler.c` une fonction `ots_handler_cleanup_on_disconnect()` appelée depuis `main.c::disconnected()` qui remet tous les slots `in_use=false` et `obj_count=0`.
+**Solution :** Implémenté — `ots_handler_cleanup_on_disconnect()` appelée depuis `main.c::disconnected()`. Remet tous les slots `in_use=false`, appelle `bt_ots_obj_delete()` pour chaque slot actif, et remet `obj_count=0`.
+
+**Fichier :** `zephyr/samples/bluetooth/peripheral_ots_railnet/src/ots_handler.c`
 
 ---
 
-## Problème en cours : L2CAP CoC impossible depuis socket raw Python
+### 9. SDU_LEN header manquant — BlueZ SOCK_SEQPACKET ne le préfixe pas
+
+**Symptôme :** Chunks 2+ échouent côté NINA avec `L2CAP RX PDU total exceeds SDU` (`sdu_len=1`, `sdu_len=2`...).
+
+**Cause :** BlueZ `SOCK_SEQPACKET` L2CAP CoC **n'ajoute PAS** automatiquement le SDU_LEN header (2 bytes LE16 au début du premier PDU du SDU). Zephyr `l2cap_chan_le_recv_seg_direct()` fait `pull_le16(seg)` sur les 2 premiers bytes pour lire `_sdu_len`. Sans le header, Zephyr lit les bytes de données comme `_sdu_len` → valeur absurde → rejet.
+
+**Diagnostic :** Log ajouté dans `l2cap.c:2688` a montré `sdu_len=1` pour chunk 2 (= `chunk_idx` encodé en LE16, dont le premier byte vaut `0x01`).
+
+**Correction :**
+```python
+# Dans send_l2cap() — ots_transfer.py
+pdu = struct.pack("<H", len(payload)) + payload
+sock.send(pdu)
+```
+
+**Fichier :** `tools/ots_transfer.py`
+
+---
+
+### 10. `bt_ots_obj_delete` retourne -EBUSY depuis `obj_write` callback
+
+**Symptôme :** Pool OTS saturé après 4 chunks (pool 4/4), OACP Create échoue avec `Insufficient Resources`.
+
+**Cause :** `bt_ots_obj_delete()` vérifie `obj->state.type == BT_GATT_OTS_OBJECT_IDLE_STATE`. Or, `oacp_write_common()` (ots_oacp.c:601) remet l'objet en IDLE **après** le retour du callback `obj_write`. Appel direct depuis `obj_write` → objet encore en WRITE state → -EBUSY.
+
+**Correction :** Différer la suppression via `k_work_submit()` :
+```c
+static uint64_t pending_delete_id;
+static K_WORK_DEFINE(delete_work, delete_work_handler);
+
+static void delete_work_handler(struct k_work *work) {
+    bt_ots_obj_delete(ots_instance, pending_delete_id);
+}
+
+// Dans obj_write, quand remaining == 0 :
+pending_delete_id = id;
+k_work_submit(&delete_work);
+```
+
+Le work handler s'exécute sur la system workqueue après que la stack OTS a remis l'objet en IDLE.
+
+**Fichier :** `zephyr/samples/bluetooth/peripheral_ots_railnet/src/ots_handler.c`
+
+---
+
+### 11. `rename()` EXDEV dans sotp-bridge — cross-device link
+
+**Symptôme :** `rename /tmp/sotp_XXXXXX -> /var/lib/sotp-bridge/ble_obj_000000.bin failed: Invalid cross-device link`
+
+**Cause :** `mkstemp()` crée le fichier temporaire dans `/tmp` (tmpfs). La destination `/var/lib/sotp-bridge` est sur le rootfs. `rename()` ne fonctionne pas entre filesystems différents → `EXDEV`.
+
+**Correction :** Fallback copy+unlink quand `errno == EXDEV` :
+```c
+if (rename(src, dst) == 0) { /* OK */ }
+else if (errno == EXDEV) {
+    // open(src), open(dst, O_CREAT|O_TRUNC), read/write loop, close, unlink(src)
+}
+```
+
+**Fichier :** `layers/STIMIODEV/SIOT10069-stimio-meta-app/recipes-connectivity/sotp-bridge/files/sotp-bridge.c`
+
+---
+
+### 12. HCI ACL buffer overflow avec SDU multi-PDU (> 245 bytes)
+
+**Symptôme :** `Not enough buffer space for L2CAP data: cont_len=251 tailroom=4` et `Unexpected L2CAP continuation` côté NINA.
+
+**Cause :** Un `sock.send()` de plus de 245 bytes (MPS NINA) provoque une fragmentation BlueZ en plusieurs PDUs. Le contrôleur nRF52840 n'a pas assez de buffers ACL pour reassembler les fragments HCI.
+
+**Correction :** Limiter chaque `sock.send()` à 243 bytes de données (+ 2 SDU_LEN = 245 = MPS). Un send = un SDU = un PDU L2CAP.
+```python
+L2CAP_DATA_PER_SDU = 241  # 245 MPS - 2 SDU_LEN - 2 L2CAP header overhead
+```
+
+**Fichier :** `tools/ots_transfer.py`
+
+---
+
+### 13. `oacp_write_seg_cb` : mauvais offset avec multi-SDU (SEG_RECV)
+
+**Symptôme :** Données corrompues dans l'objet OTS — chaque SDU écrase l'offset 0 au lieu d'écrire séquentiellement.
+
+**Cause :** `oacp_write_seg_cb()` dans `ots_oacp.c` utilisait `seg_offset` qui repart à 0 pour chaque nouveau SDU. Avec `CONFIG_BT_L2CAP_SEG_RECV`, chaque SDU est un segment indépendant.
+
+**Correction :** Utiliser `write_op->recv_len` (octets accumulés depuis le début de l'OACP Write) au lieu de `seg_offset` :
+```c
+write_op = &ots->cur_obj->state.write_op;
+offset = write_op->oacp_params.offset + write_op->recv_len;
+```
+
+**Fichier :** `zephyr/subsys/bluetooth/services/ots/ots_oacp.c`
+
+---
+
+### 14. Pool OTS saturé — k_work delete non exécuté avant le chunk suivant
+
+**Symptôme :** `Insufficient Resources` sur OACP Create du chunk 4, alors que le pool fait 4 slots.
+
+**Cause :** Le `k_work_submit(&delete_work)` du chunk N ne s'exécute pas avant que le client envoie OACP Create du chunk N+1 (temps entre les chunks < scheduling du k_work).
+
+**Correction :** Ajouter un `asyncio.sleep(0.05)` entre les chunks côté Python pour laisser le temps au k_work de supprimer l'objet.
+
+**Fichier :** `tools/ots_transfer.py`
+
+---
+
+### 15. Pins RTS/CTS dans pinctrl bloquent la réception UART
+
+**Symptôme :** La NINA ne reçoit **aucun octet** sur l'UART. Aucun log CRC mismatch, rien — silence total.
+
+**Cause :** Les pins `UART_RTS` (P0.31) et `UART_CTS` (P1.12) étaient déclarés dans le `pinctrl` DTS même quand `hw-flow-control` était désactivé. Le driver UARTE nRF52840 programme le registre `PSEL.CTS` dans tous les cas, et le matériel **bloque la réception** en attendant que le signal CTS soit asserté — ce qui ne se produit jamais puisque l'iMX6 ne route pas RTS vers la NINA.
+
+**Diagnostic :**
+```bash
+# iMX6 — envoyer un octet de test
+stty -F /dev/ttymxc7 115200 raw -echo
+echo -ne '\xAA' > /dev/ttymxc7
+# Rien dans les logs RTT NINA → problème physique/matériel
+```
+
+**Correction :** Retirer (commenter) les pins RTS/CTS du pinctrl quand `hw-flow-control` est désactivé :
+```dts
+uart0_default: uart0_default {
+    group1 {
+        psels = <NRF_PSEL(UART_RX,  0, 29)>,
+                <NRF_PSEL(UART_TX,  1, 13)>;
+        /* RTS/CTS omis — décommenter quand hw-flow-control activé */
+        /* <NRF_PSEL(UART_RTS, 0, 31)>,
+           <NRF_PSEL(UART_CTS, 1, 12)>; */
+    };
+};
+```
+
+**Fichier :** `zephyr/boards/u-blox/railnet200_nina_b301/railnet200_nina_b301/railnet200_nina_b301_nrf52840-pinctrl.dtsi`
+
+---
+
+### 16. UART RX polling perd des octets (CRC mismatch systématique)
+
+**Symptôme :** `sotp_rx: CRC mismatch` sur chaque trame reçue par la NINA depuis `sotp-send`. Les CRC reçus contiennent des valeurs ASCII (`0x203a` = ` :`, `0x6e61` = `na`) — preuve que le payload est décalé.
+
+**Cause :** `uart_poll_in()` ne bufferise **qu'un seul octet** (`EVENTS_RXDRDY`). À 115200 baud, un octet arrive toutes les ~87µs. Le `k_sleep(K_MSEC(1))` entre chaque poll introduit 1ms de latence, pendant laquelle ~11 octets arrivent et sont perdus (écrasés par le suivant).
+
+**Diagnostic :** Les valeurs CRC reçues sont des fragments de texte ASCII du fichier JSON envoyé → le payload est corrompu par des octets manquants → la state machine SOTP perd la synchronisation.
+
+**Correction :** Passer au mode **interrupt-driven** avec un ring buffer de 1024 octets :
+```c
+static void uart_irq_rx_handler(const struct device *dev, void *user_data)
+{
+    uint8_t tmp[32];
+    int len;
+    while ((len = uart_fifo_read(dev, tmp, sizeof(tmp))) > 0) {
+        for (int i = 0; i < len; i++) {
+            uint32_t next = (rx_ring_head + 1) % SOTP_RX_RING_SIZE;
+            if (next == rx_ring_tail) continue;  // ring plein
+            rx_ring_buf[rx_ring_head] = tmp[i];
+            rx_ring_head = next;
+        }
+    }
+}
+
+// Init:
+uart_irq_callback_set(uart_dev, uart_irq_rx_handler);
+uart_irq_rx_enable(uart_dev);
+```
+
+Le thread `sotp_rx` consomme le ring buffer et alimente la state machine SOTP.
+
+**Fichier :** `zephyr/samples/bluetooth/peripheral_ots_railnet/src/uart_relay.c`
+
+---
+
+### 17. OTS Object créé par le serveur a size.cur = 0 (invisible via OLCP)
+
+**Symptôme :** Après `sotp-send` sur l'iMX6, OLCP GoTo Next retourne Success mais Object Name/Size retourne toujours "Directory". L'objet ajouté par `ots_handler_add_object_from_uart()` est invisible pour le client BLE.
+
+**Cause :** `obj_created()` retournait `created_desc->size.cur = 0` pour **tous** les objets. Les objets créés côté serveur (via `bt_ots_obj_add()`) ont leurs données copiées **après** la création. Mais Zephyr OTS voit `size.cur=0` et considère l'objet comme vide — OLCP le saute ou OACP Read lit 0 bytes.
+
+**Correction :** Ajout d'une variable `pending_data_len` positionnée avant `bt_ots_obj_add()`. Le callback `obj_created()` retourne `size.cur = pending_data_len` quand `pending_name` est défini (création serveur), et `size.cur = 0` sinon (OACP Create client BLE) :
+```c
+static uint32_t pending_data_len;
+
+// Dans obj_created() :
+created_desc->size.cur = pending_name ? pending_data_len : 0;
+
+// Dans ots_handler_add_object_from_uart() :
+pending_data_len = (uint32_t)len;
+err = bt_ots_obj_add(ots_instance, &param);
+pending_data_len = 0;
+```
+
+**Fichier :** `zephyr/samples/bluetooth/peripheral_ots_railnet/src/ots_handler.c`
+
+---
+
+### 18. L2CAP CoC SDU_LEN header non strippé en réception
+
+**Symptôme :** Le fichier reçu via `ots_transfer.py receive` contient des octets parasites `\x00\x01` au début et au milieu du contenu. Le MD5 ne matche pas.
+
+**Cause :** Zephyr OTS envoie les données via `bt_gatt_ots_l2cap_send()` qui ajoute un **SDU_LEN header** (2 bytes LE16) en tête de chaque SDU. Pour un objet de 522 bytes, Zephyr envoie 2 SDUs : le premier de 256 bytes data (+ 2 SDU_LEN = 258), le second de 268 bytes data (+ 2 SDU_LEN = 270). BlueZ `SOCK_SEQPACKET` **ne strip pas** ces headers — ils apparaissent dans les données retournées par `recv()`.
+
+**Diagnostic :**
+```python
+# Premiers octets reçus : 00 01 7b 0a 20 20 22 73
+#                          ^^^^^  = SDU_LEN (256 en LE16)
+#                                ^^^^^^^^^^^^^^^^ = début du JSON "{..."
+# Offset 258 : 00 01 65 79 66 69 6c 65
+#              ^^^^^  = SDU_LEN du 2ème SDU
+```
+
+**Correction :** Parser les SDU_LEN headers dans le flux brut reçu :
+```python
+# Assembler tous les recv() bruts
+all_raw = b"".join(raw_chunks)
+
+# Parser les SDUs : [SDU_LEN LE16][data]
+received = b""
+pos = 0
+while pos + 2 <= len(all_raw) and len(received) < obj_size_cur:
+    sdu_len = struct.unpack("<H", all_raw[pos:pos + 2])[0]
+    pos += 2
+    received += all_raw[pos:pos + sdu_len]
+    pos += sdu_len
+
+# Tronquer à la taille annoncée
+received = received[:obj_size_cur]
+```
+
+**Fichier :** `tools/ots_transfer.py`
+
+---
+
+### 19. OLCP GoTo First sélectionne le Directory Listing Object
+
+**Symptôme :** `receive_file()` lit toujours "Directory" (29 bytes) au lieu de l'objet envoyé par `sotp-send`.
+
+**Cause :** Le premier objet dans la liste OTS (ID 0x000000000000) est le **Directory Listing Object** (spec OTS §4.5.1), créé automatiquement par Zephyr quand `CONFIG_BT_OTS_DIR_LIST_OBJ=y`. OLCP GoTo First le sélectionne systématiquement.
+
+**Correction :** Après OLCP GoTo First, envoyer un OLCP GoTo Next pour sauter le Directory :
+```python
+# GoTo First
+await client.write_gatt_char(UUID_OLCP, struct.pack("<B", 0x01), response=True)
+await olcp_event.wait()
+
+# Skip Directory → GoTo Next
+await client.write_gatt_char(UUID_OLCP, struct.pack("<B", 0x02), response=True)
+await olcp_event.wait()
+```
+
+**Fichier :** `tools/ots_transfer.py`
+
+---
+
+### 20. OLCP write sans subscription aux indications → CCCD Improperly Configured
+
+**Symptôme :** `BleakGATTError: GATT CCCD Improperly Configured` lors de l'écriture OLCP GoTo First.
+
+**Cause :** La spec BLE OTS exige que le client souscrive aux indications OLCP (CCCD = 0x0002) avant d'écrire sur le point de contrôle. Sans souscription, le serveur rejette l'écriture.
+
+**Correction :** Souscrire aux indications OLCP avant le premier write :
+```python
+await client.start_notify(UUID_OLCP, olcp_indication_handler)
+# Puis seulement :
+await client.write_gatt_char(UUID_OLCP, olcp_first, response=True)
+```
+
+**Fichier :** `tools/ots_transfer.py`
+
+---
+
+### 21. sotp-bridge à 1 Mbaud vs NINA à 115200
+
+**Symptôme :** `sotp-bridge` ne reçoit pas les trames SOTP OBJ_FROM_BLE que la NINA envoie. Les fichiers envoyés depuis Ubuntu n'arrivent pas sur le filesystem iMX6. Le `journalctl` affiche `opened /dev/ttymxc7 at 1000000 baud (CRTSCTS)`.
+
+**Cause :** Le `sotp-bridge.c` avait été compilé avec `B1000000` + `CRTSCTS` lors d'une tentative de passage à 1 Mbaud. La NINA avait été revert à 115200 sans flow control, mais pas le sotp-bridge.
+
+**Correction :** Remettre le sotp-bridge à 115200 sans flow control :
+```c
+cfsetospeed(&tty, B115200);
+cfsetispeed(&tty, B115200);
+cfmakeraw(&tty);
+tty.c_cflag &= ~CRTSCTS;  /* pas de flow control */
+```
+
+**Fichier :** `layers/STIMIODEV/SIOT10069-stimio-meta-app/recipes-connectivity/sotp-bridge/files/sotp-bridge.c`
+
+---
+
+### 22. Modem Quectel USB cause des CRC mismatch UART
+
+**Symptôme :** CRC mismatch intermittents sur les trames SOTP de 30 KB entre NINA et iMX6. Les chunks 0 sont perdus, les suivants arrivent avec "no active transfer". Le modem USB Quectel EG91 se reconnecte (`usb 1-1: new high-speed USB device`) pendant les transferts.
+
+**Cause :** La reconnexion du modem USB génère des interruptions kernel intenses qui perturbent le driver UART iMX6 (`ttymxc7`). À 115200 baud, une trame de 30 KB prend ~2.7s → large fenêtre d'interférence.
+
+**Contournement :**
+```bash
+# Arrêter le service PPP avant les transferts BLE
+systemctl stop ppp
+```
+
+**Amélioration future :** Passer à 1 Mbaud + hw-flow-control (nécessite investigation DTS iMX6 pour router RTS/CTS vers la NINA), ce qui réduirait le temps de transfert UART à ~0.3s par chunk.
+
+---
+
+### 23. ACK confusion dans multi-chunk FILE_REQUEST
+
+**Symptôme** : le sotp-bridge envoie le chunk 0 puis timeout en attente de l'ACK. Le CRC mismatch `recv=0xaaf9 calc=0xc2f9` est reproductible à chaque fois.
+
+**Cause** : Quand le sotp-bridge envoie un OBJ_TO_BLE, la NINA l'ajoute au pool OTS et envoie immédiatement un ACK (type 0x03). Le `wait_for_ack` du sotp-bridge devait attendre le DELETE_ACK (type 0x07) mais recevait le ACK normal (0x03) qui arrivait pendant le flush, et les octets résiduels dans le buffer UART corrompaient le CRC.
+
+**Correction** :
+1. Introduire `SOTP_TYPE_DELETE_ACK` (0x07) distinct de `SOTP_TYPE_ACK` (0x03)
+2. Vider le buffer UART (flush 50ms) avant d'attendre le DELETE_ACK
+3. Réinitialiser la state machine SOTP RX dans `wait_for_ack`
+
+**Fichiers** : `uart_relay.h`, `uart_relay.c`, `sotp-bridge.c`
+
+---
+
+### 24. bt_ots_obj_delete passe toujours conn=NULL au callback obj_deleted
+
+**Symptôme** : le DELETE_ACK n'est jamais envoyé car le test `if (conn)` dans `obj_deleted` est toujours faux.
+
+**Cause** : Zephyr `bt_ots_obj_delete()` (ots.c:420) appelle `obj_deleted(ots, NULL, obj->id)` avec conn=NULL **toujours**, que la suppression vienne d'un OACP Delete client ou d'un appel interne.
+
+**Correction** : utiliser un flag `cleaning_up` au lieu de tester `conn`. Le flag est mis à `true` pendant `ots_handler_cleanup_on_disconnect()` et `false` sinon. `obj_deleted` envoie le DELETE_ACK quand `!cleaning_up`.
+
+**Fichier** : `ots_handler.c`
+
+---
+
+### 25. BlueZ SOCK_SEQPACKET limite les crédits L2CAP à ~16
+
+**Symptôme** : un objet OTS de 30 KB n'est reçu qu'à hauteur de ~6.7 KB (26 SDUs × 258 bytes). Le `recv()` retourne EOF après 6708 bytes.
+
+**Cause** : BlueZ `SOCK_SEQPACKET` pour L2CAP CoC n'accorde que ~16 crédits initiaux au récepteur. Chaque crédit permet un SDU de ~258 bytes (MPS 245 + SDU_LEN 2 + overhead). 16 × 258 ≈ 4128 bytes maximum recevable. Les crédits supplémentaires ne sont pas accordés tant que le SDU complet n'est pas consommé par `recv()`, mais le SDU fait 30 KB et ne peut jamais être "complet" avec seulement 16 crédits.
+
+**Contournement** : réduire les chunks OTS à 3800 bytes (15 SDUs, dans les 16 crédits).
+
+**Amélioration future** : utiliser `SOCK_STREAM`, l'API D-Bus BlueZ, ou patcher le kernel.
+
+**Fichier** : `sotp-bridge.c` (OTS_OBJ_MAX_SIZE)
+
+---
+
+## Problème résolu : L2CAP CoC impossible depuis socket raw Python
 
 ### Description
 
-C'est le problème **bloquant actuel**. Le canal L2CAP CoC PSM 0x0025 ne s'ouvre jamais côté NINA, malgré :
+Ce problème a été le **bloquant principal** avant la solution `libc.connect()` avec `sockaddr_l2`. Le canal L2CAP CoC PSM 0x0025 ne s'ouvre jamais côté NINA, malgré :
 - NINA confirmée fonctionnelle (PSM 0x0025 enregistré, `l2cap_accept` visible en logs DBG)
 - Connexion GATT Bleak opérationnelle (OACP Create, Name Write OK)
 - Handle HCI connexion existante : `2048` (confirmé via `hcitool con`)
